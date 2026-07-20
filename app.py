@@ -103,7 +103,12 @@ with yan_panel:
         st.markdown("**Son yükleme sonucu:**")
         for res in st.session_state["last_upload_results"]:
             if res["basarili"]:
-                st.success(f"✅ {res['dosya']} — sorgulamaya hazır")
+                st.success(
+                    f"✅ {res['dosya']} — sorgulamaya hazır\n\n"
+                    f"⏱️ Dönüştürme: {res['donusum_sure']:.1f} sn · "
+                    f"İndeksleme: {res['index_sure']:.1f} sn · "
+                    f"**Toplam: {res['toplam_sure']:.1f} sn**"
+                )
             else:
                 st.error(f"❌ {res['dosya']}: {res['hata']}")
         if st.button("Kapat", key="close_upload_results", use_container_width=True):
@@ -116,8 +121,39 @@ with yan_panel:
         accept_multiple_files=True, key="file_uploader_widget",
     )
     if yuklenen and st.button("➕ İndeksle", use_container_width=True, key="index_button"):
-        # ... (yükleme kodu aynı kalıyor)
-        pass  # Mevcut yükleme kodunu bozmayalım, burayı şimdilik atlıyorum
+        Path(UPLOAD_TMP_DIR).mkdir(exist_ok=True)
+        results = []
+        for f in yuklenen:
+            tmp_path = Path(UPLOAD_TMP_DIR) / f.name
+            tmp_path.write_bytes(f.getbuffer())
+            t_baslangic = time.time()
+            donusum_sure = 0.0
+            index_sure = 0.0
+            try:
+                with st.spinner(f"{f.name} işleniyor..."):
+                    if tmp_path.suffix.lower() == ".pdf":
+                        t_c0 = time.time()
+                        md_path = engine.convert_pdf_to_markdown(str(tmp_path), MD_OUTPUT_DIR)
+                        donusum_sure = time.time() - t_c0
+                    else:
+                        md_path = str(tmp_path)
+
+                    t_i0 = time.time()
+                    engine.add_document(md_path, force=True)
+                    index_sure = time.time() - t_i0
+
+                results.append({
+                    "dosya": f.name,
+                    "basarili": True,
+                    "donusum_sure": donusum_sure,
+                    "index_sure": index_sure,
+                    "toplam_sure": time.time() - t_baslangic,
+                })
+            except Exception as e:
+                results.append({"dosya": f.name, "basarili": False, "hata": str(e)})
+
+        st.session_state["last_upload_results"] = results
+        st.rerun()
 
 # =====================================================================
 # ANA KOLON: Arama
@@ -187,7 +223,7 @@ with ana_kolon:
 
                 belgeler = sonuc.get("documents", [])
 
-                # Sorgu geçmişi
+                # Sorgu geçmişi (oturum içi)
                 st.session_state["history"].append({
                     "id": len(st.session_state["history"]),
                     "soru": soru,
@@ -195,6 +231,22 @@ with ana_kolon:
                     "sure": toplam_sure,
                     "sonuc_sayisi": len(belgeler),
                 })
+
+                # Kalıcı veritabanı kaydı (history.db) — F1/Accuracy için
+                kaynak_ozet = [{"path": d["path"], "line": d.get("line")} for d in belgeler[:5]]
+                if ham_tiklandi:
+                    ham_extractive = sonuc.get("extractive_answer") or {}
+                    history.log(
+                        query=soru, answer_type="ham",
+                        answer_text=ham_extractive.get("summary", ""),
+                        sources=kaynak_ozet, timings=t, resources=sonuc.get("resources"),
+                    )
+                if akici_tiklandi and akici_metin is not None:
+                    history.log(
+                        query=soru, answer_type="akici", answer_text=akici_metin,
+                        sources=kaynak_ozet, timings=t, resources=sonuc.get("resources"),
+                        grounding=grounding, removed_sentence_count=removed_count,
+                    )
 
                 # --- HAM CEVAP (İstediğin Yeni Yapı) ---
                 if ham_tiklandi:
@@ -216,10 +268,57 @@ with ana_kolon:
                     st.caption("✅ Tüm bilgiler kaynak metinlerden birebir alınmıştır.")
                     st.markdown("---")
 
-                # Akıcı Cevap kısmı (değişmedi)
+                # --- AKICI CEVAP (Ollama, yeniden yazılmış, doğrulanmış) ---
                 if akici_tiklandi:
-                    # ... (mevcut akıcı cevap kodu aynı kalıyor)
-                    pass
+                    if akici_metin is None:
+                        st.info(
+                            "✨ Akıcı Cevap üretilemedi (kaynak bulunamadı). "
+                            "Ham Cevap'ı deneyin."
+                        )
+                    else:
+                        st.subheader("✨ Akıcı Cevap")
+                        if engine.last_rewrite_used_fallback:
+                            st.caption(
+                                "ℹ️ Ollama kullanılamıyor (kurulu değil/çalışmıyor), "
+                                "bu yüzden LLM KULLANILMADAN, kaynaktan birebir alınan cümlelerle "
+                                "anında oluşturulan bir alternatif gösteriliyor:"
+                            )
+                            st.markdown(akici_metin)
+                        elif grounding:
+                            if grounded_sentences:
+                                for g in grounded_sentences:
+                                    st.markdown(g["text"])
+                            else:
+                                st.warning(
+                                    "Üretilen cevabın hiçbir cümlesi kaynak metinlerle "
+                                    "doğrulanamadı, bu yüzden hiçbiri gösterilmiyor. "
+                                    "Ham Cevap'ı kullanın."
+                                )
+                            if removed_count:
+                                with st.expander(
+                                    f"🛑 {removed_count} cümle kaynakla doğrulanamadığı için "
+                                    "GÖSTERİLMEDİ (olası uydurma)"
+                                ):
+                                    st.caption(
+                                        "Bu cümleler, sistemin oluşturduğu cevaptan çıkarıldı "
+                                        "çünkü ya kaynak metinle yeterince örtüşmüyor ya da "
+                                        "içindeki isimler kaynakta birlikte geçmiyor. Sadece "
+                                        "şeffaflık için gösteriliyor, güvenilir bilgi olarak "
+                                        "KULLANILMAMALIDIR."
+                                    )
+                                    for g in grounding:
+                                        if not g["grounded"]:
+                                            st.caption(f"~~{g['text']}~~")
+                            st.caption(
+                                "⚠️ Bu cevap bir LLM tarafından yeniden yazılmıştır. "
+                                "Doğrulanamayan cümleler otomatik filtrelendi, ama %100 "
+                                "halüsinasyon garantisi generatif bir modelde mümkün "
+                                "değildir. Kesin/uydurmasız bilgi için her zaman Ham "
+                                "Cevap'ı esas alın."
+                            )
+                        else:
+                            st.markdown(akici_metin)
+                        st.markdown("---")
 
                 # Kaynak metinler
                 if belgeler:

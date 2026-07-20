@@ -50,12 +50,29 @@ _ABBREVIATIONS = {"hz", "dr", "prof", "doç", "sn", "vb", "vs", "yy", "m.ö", "m
 
 def _clean_markdown(text: str) -> str:
     """Kaynak node içeriğindeki markdown gürültüsünü (başlık #, madde
-    işaretleri, tablo | çizgileri) temizler ki cümle çıkarımı daha
-    okunabilir sonuçlar versin."""
-    text = re.sub(r"^#{1,6}\s*", "", text, flags=re.MULTILINE)
-    text = re.sub(r"^[\-\*\u2022]+\s*", "", text, flags=re.MULTILINE)
+    işaretleri, numaralı liste 1)/2), kalın/italik *, tablo | çizgileri)
+    temizler VE her orijinal satırı kendi cümlesi olarak korur (satır
+    sonuna nokta yoksa ekler). Bu son kısım kritik: kaynaktaki madde
+    işaretli listeler çoğu zaman nokta ile bitmiyor — bu yüzden temizlik
+    sonrası hepsi TEK DEV CÜMLEYE birleşip alakasız maddelerin (örn.
+    'Pankuş' sorusuna Asurlular/Yunanlılar hakkındaki alakasız cümlelerin
+    de) cevaba karışmasına yol açıyordu. Satır bazında nokta eklemek her
+    maddeyi ayrı, filtrelenebilir bir cümle haline getirir."""
+    text = re.sub(r"^\s*#{1,6}\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*[\-\*\u2022]+\s*", "", text, flags=re.MULTILINE)
+    text = re.sub(r"^\s*\d+[\.\)]\s*", "", text, flags=re.MULTILINE)  # "1) " / "1. " madde no'ları
+    text = re.sub(r"\*{1,3}", "", text)  # kalın/italik işaretleri (** / *)
     text = re.sub(r"-{3,}", " ", text)
     text = text.replace("|", " ")
+
+    lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+    fixed_lines = []
+    for ln in lines:
+        if ln[-1] not in ".!?:":
+            ln += "."
+        fixed_lines.append(ln)
+    text = " ".join(fixed_lines)
+
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
@@ -190,7 +207,7 @@ class CKBEngine:
 
         self._ollama = _try_import_ollama() if enable_ollama else None
         self._ollama_available = self._ollama is not None and self._check_ollama_alive()
-        self.last_rewrite_timed_out = False
+        self.last_rewrite_used_fallback = False
 
         # Yerel eş anlamlı sözlüğü: TEK SEFERLİK yükleme, sorgu başına maliyet
         # yok. TDK online / Node.js artık genişletme için ZORUNLU DEĞİL.
@@ -264,73 +281,52 @@ class CKBEngine:
         except Exception as e:
             logger.warning("Ollama eş anlamlı üretimi başarısız (%s): %s", word, e)
             return []
-            
-            
-       def rewrite_text(self, query: str, raw_nodes: list,
-                      max_nodes: int = 3, max_chars_per_node: int = 600,
-                      max_output_tokens: int = 300) -> str:
-        """Akıcı Cevap Üretimi"""
-        if not self._ollama_available:
-            logger.warning("Ollama mevcut değil, Akıcı Cevap devre dışı.")
-            return None
+
+    def rewrite_text(self, query: str, raw_nodes: list,
+                      max_nodes: int = 3, max_chars_per_node: int = 800,
+                      max_output_tokens: int = 400) -> str:
+        """
+        Akıcı Cevap üretimi — Ollama ne kadar sürerse sürsün SONUNA KADAR
+        beklenir (zaman aşımı YOK, kullanıcı isteği üzerine kaldırıldı).
+        Ollama tamamen kullanılamıyorsa (kurulu değil/çalışmıyor), LLM
+        kullanmadan Ham Cevap'tan bir alternatif üretilir — ama bu SADECE
+        Ollama'ya hiç ERİŞİLEMEDİĞİNDE devreye girer, yavaş olduğu için değil.
+        """
+        self.last_rewrite_used_fallback = False
         if not raw_nodes:
             return None
 
-        try:
-            context = "\n\n---\n\n".join(
-                f"[Kaynak {i+1}: {n.get('path', '')}] {n.get('content', '')[:max_chars_per_node]}"
-                for i, n in enumerate(raw_nodes[:max_nodes])
-            )
-            prompt = (
-                "Sen güvenilir bir tarih uzmanısın. Aşağıdaki kaynaklara dayanarak "
-                "kullanıcının sorusuna **doğal, akıcı ve kısa** Türkçe bir paragraf yaz. "
-                "Kaynak dışında bilgi ekleme.\n\n"
-                f"Soru: {query}\n\nKaynaklar:\n{context}\n\nCevap:"
-            )
+        if self._ollama_available:
+            try:
+                context = "\n\n---\n\n".join(
+                    f"[Kaynak: {n['path']}] {n['content'][:max_chars_per_node]}"
+                    for n in raw_nodes[:max_nodes]
+                )
+                prompt = (
+                    "Aşağıdaki kaynak metinlere DAYANARAK, kullanıcının sorusuna "
+                    "Türkçe, akıcı ve doğal bir cevap yaz. Konuyla ilgili tarihleri "
+                    "ve önemli olayları MUTLAKA belirt. SADECE verilen kaynaklardaki "
+                    "bilgiyi kullan, hiçbir şey uydurma, kaynakta açıkça belirtilmeyen "
+                    "kişi/olay ilişkileri KURMA. Kaynaklarda cevap yoksa 'Bu konuda "
+                    "kaynaklarda yeterli bilgi bulunamadı.' yaz.\n\n"
+                    f"Soru: {query}\n\nKaynaklar:\n{context}\n\nCevap:"
+                )
+                resp = self._ollama.chat(
+                    model=self.ollama_model,
+                    messages=[{"role": "user", "content": prompt}],
+                    options={"temperature": 0.2, "num_predict": max_output_tokens, "num_ctx": 4096},
+                )
+                return resp["message"]["content"].strip()
+            except Exception as e:
+                logger.warning("Akıcı cevap üretimi başarısız, LLM'siz alternatife geçiliyor: %s", e)
 
-            resp = self._ollama.chat(
-                model=self.ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "temperature": 0.4,
-                    "num_predict": max_output_tokens,
-                    "num_ctx": 4096,
-                },
-            )
-            return resp["message"]["content"].strip()
+        # --- Ollama tamamen kullanılamıyor: LLM'siz alternatif ---
+        self.last_rewrite_used_fallback = True
+        extractive = self.build_extractive_answer(query, raw_nodes, max_sentences=4, max_docs=2)
+        if not extractive or not extractive.get("summary"):
+            return "Bu konuda kaynaklarda yeterli bilgi bulunamadı."
+        return extractive["summary"]
 
-        except Exception as e:
-            logger.error(f"Akıcı cevap üretimi HATA: {e}")
-            return None
-
-        def _call():
-            context = "\n\n---\n\n".join(
-                f"[Kaynak: {n['path']}] {n['content'][:max_chars_per_node]}"
-                for n in raw_nodes[:max_nodes]
-            )
-            prompt = (
-                "Aşağıdaki kaynak metinlere DAYANARAK, kullanıcının sorusuna "
-                "Türkçe, akıcı ve doğal bir cevap yaz (en fazla 4-5 cümle). "
-                "SADECE verilen kaynaklardaki bilgiyi kullan, hiçbir şey uydurma.\n\n"
-                f"Soru: {query}\n\nKaynaklar:\n{context}\n\nCevap:"
-            )
-            resp = self._ollama.chat(
-                model=self.ollama_model,
-                messages=[{"role": "user", "content": prompt}],
-                options={
-                    "temperature": 0.3,
-                    "num_predict": max_output_tokens,
-                    "num_ctx": 2048,
-                },
-            )
-            return resp["message"]["content"].strip()
-
-        try:
-            return _call()
-        except Exception as e:
-            logger.warning("Akıcı cevap üretimi başarısız: %s", e)
-            return None
-  
     def check_grounding(self, answer_text: str, raw_nodes: list, min_overlap: int = 2) -> list:
         """
         Akıcı Cevap tamamen halüsinasyonsuz OLAMAZ (üretken bir LLM
@@ -515,14 +511,20 @@ class CKBEngine:
 
             for sent in sentences:
                 sent_clean = sent.strip()
-                if len(sent_clean) < 30:
+                # 15'e düşürüldü: başlık/tarih satırları (örn. "HZ. ALİ DÖNEMİ
+                # (656-661)") kısa ama önemli — eski 30 karakter eşiği bunları
+                # eleyip tarihlerin cevaptan kaybolmasına sebep oluyordu.
+                if len(sent_clean) < 15:
                     continue
                 sent_terms = {t.lower() for t in re.findall(r"\w+", sent_clean, flags=re.UNICODE)}
                 overlap = len(query_terms & sent_terms)
                 if overlap >= 1:
+                    # Tarih (yıl/yıl aralığı) içeren cümlelere öncelik puanı —
+                    # müfredat sorularında "ne zaman" bilgisi kritik önemde.
+                    has_date = bool(re.search(r"\b\d{3,4}\b", sent_clean))
                     all_relevant_sentences.append({
                         "text": sent_clean,
-                        "overlap": overlap,
+                        "overlap": overlap + (2 if has_date else 0),
                         "doc_score": doc.get("score", 0),
                         "source": self._format_location(doc),
                     })

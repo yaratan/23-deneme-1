@@ -1,2 +1,0 @@
-# komo
-my rag

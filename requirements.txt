@@ -1,0 +1,5 @@
+streamlit
+pytreesearch
+ollama
+psutil
+opendataloader-pdf

@@ -120,6 +120,58 @@ def _entity_pairs(entities: set) -> set:
             for i in range(len(ents)) for j in range(i + 1, len(ents))}
 
 
+def _extract_anchor_terms(query: str, flat_results: list) -> set:
+    """Sorgudaki kelimelerden, KORPUSTA (o an dönen belgelerde) özel isim
+    olarak geçenleri 'çapa terim' (anchor term) olarak işaretler.
+
+    NEDEN GEREKLİ: "gordion nerenin başkenti" gibi bir sorguda "başkenti"
+    kelimesi onlarca belgede (Kudüs, Ninova, Gordion, Roma...) geçebilir
+    ve tek başına ayırt edici değildir. Ama "Gordion" korpusta özel isim
+    olarak geçiyorsa ve sorguda da geçiyorsa, bu SORUNUN ASIL ÖZNESİDİR
+    ve diğer belgeler bu belgenin önüne geçmemelidir.
+
+    Kullanıcı sorguyu tamamen küçük harfle yazsa bile ("gordion...") bu
+    fonksiyon çalışır: karşılaştırma sorgu tarafında case-insensitive
+    yapılır, korpustaki YAZIMA (büyük harfli haline) göre eşleşme aranır.
+    _capitalized_candidates zaten bilinen isim-olmayan kelimeleri
+    (STOPWORDS, _NON_ENTITY_STARTERS) eliyor, o yüzden burada ek bir
+    filtre gerekmiyor."""
+    corpus_entities = set()
+    for doc in flat_results:
+        content = _clean_markdown(doc.get("content", ""))
+        for sent in _split_sentences(content):
+            corpus_entities |= _capitalized_candidates(sent)
+
+    corpus_entities_lower = {e.lower(): e for e in corpus_entities}
+    query_terms = {t.lower() for t in re.findall(r"\w+", query, flags=re.UNICODE)}
+    return {corpus_entities_lower[t] for t in query_terms if t in corpus_entities_lower}
+
+
+def _rerank_by_anchor_terms(flat_results: list, anchors: set) -> tuple:
+    """anchors boşsa (sorguda korpusla eşleşen özel isim yoksa) dokunmaz.
+    Varsa: içeriğinde en az bir anchor terim GEÇEN belgeleri öne alır
+    (case-sensitive arama — "Gordion" ile "gordion" karışmasın diye
+    korpustaki orijinal yazımı kullanıyoruz). Eşleşmeyenler tamamen
+    silinmez, sona itilir (Kaynak Metinler sekmesinde hâlâ görünsünler,
+    şeffaflık için).
+
+    Döner: (yeniden_sıralı_liste, kanıt_var_mı: bool). kanıt_var_mı
+    False ise HİÇBİR belgede anchor terim geçmiyor demektir — bu durumda
+    rewrite_text çağrılmadan önce sonucu kontrol edin (bkz. rewrite_text
+    içindeki has_sufficient_evidence parametresi)."""
+    if not anchors:
+        return flat_results, True
+
+    matched, unmatched = [], []
+    for doc in flat_results:
+        content = doc.get("content", "")
+        (matched if any(a in content for a in anchors) else unmatched).append(doc)
+
+    if matched:
+        return matched + unmatched, True
+    return flat_results, False
+
+
 def _try_import_ollama():
     try:
         import ollama  # noqa: F401
@@ -250,6 +302,7 @@ class CKBEngine:
                 model=self.ollama_model,
                 messages=[{"role": "user", "content": prompt}],
                 options={"temperature": 0},
+                keep_alive="30m",
             )
             corrected = resp["message"]["content"].strip().strip('"').strip()
             return corrected if corrected else query
@@ -271,6 +324,7 @@ class CKBEngine:
                 model=self.ollama_model,
                 messages=[{"role": "user", "content": prompt}],
                 options={"temperature": 0},
+                keep_alive="30m",
             )
             content = resp["message"]["content"].strip()
             content = re.sub(r"^```(json)?|```$", "", content, flags=re.MULTILINE).strip()
@@ -284,17 +338,28 @@ class CKBEngine:
 
     def rewrite_text(self, query: str, raw_nodes: list,
                       max_nodes: int = 3, max_chars_per_node: int = 800,
-                      max_output_tokens: int = 400) -> str:
+                      max_output_tokens: int = 400,
+                      has_sufficient_evidence: bool = True) -> str:
         """
         Akıcı Cevap üretimi — Ollama ne kadar sürerse sürsün SONUNA KADAR
         beklenir (zaman aşımı YOK, kullanıcı isteği üzerine kaldırıldı).
         Ollama tamamen kullanılamıyorsa (kurulu değil/çalışmıyor), LLM
         kullanmadan Ham Cevap'tan bir alternatif üretilir — ama bu SADECE
         Ollama'ya hiç ERİŞİLEMEDİĞİNDE devreye girer, yavaş olduğu için değil.
+
+        has_sufficient_evidence: search()'ün döndürdüğü
+        "has_sufficient_evidence" değerini buraya geçirin. False ise
+        (sorgudaki özel isim hiçbir belgede geçmiyorsa) LLM'i HİÇ
+        ÇAĞIRMADAN doğrudan "yeterli bilgi yok" döneriz — hem gereksiz
+        bekleme süresini keser hem de LLM'in yanlış belgeden (örn.
+        "Gordion" yerine "Kudüs" belgesinden) cevap uydurmasını en
+        baştan engeller.
         """
         self.last_rewrite_used_fallback = False
         if not raw_nodes:
             return None
+        if not has_sufficient_evidence:
+            return "Bu konuda kaynaklarda yeterli ve net bilgi bulunmamaktadır."
 
         if self._ollama_available:
             try:
@@ -304,17 +369,19 @@ class CKBEngine:
                 )
                 prompt = (
                     "Aşağıdaki kaynak metinlere DAYANARAK, kullanıcının sorusuna "
-                    "Türkçe, akıcı ve doğal bir cevap yaz. Konuyla ilgili tarihleri "
-                    "ve önemli olayları MUTLAKA belirt. SADECE verilen kaynaklardaki "
-                    "bilgiyi kullan, hiçbir şey uydurma, kaynakta açıkça belirtilmeyen "
-                    "kişi/olay ilişkileri KURMA. Kaynaklarda cevap yoksa 'Bu konuda "
-                    "kaynaklarda yeterli bilgi bulunamadı.' yaz.\n\n"
+                    "Türkçe, akıcı ve doğal bir cevap yaz. Kaynakta tarih veya "
+                    "önemli olay bilgisi VARSA belirt; yoksa uydurma. SADECE "
+                    "verilen kaynaklardaki bilgiyi kullan, hiçbir şey ekleme, "
+                    "kaynakta açıkça belirtilmeyen kişi/olay ilişkileri KURMA. "
+                    "Kaynaklarda cevap yoksa 'Bu konuda kaynaklarda yeterli bilgi "
+                    "bulunamadı.' yaz.\n\n"
                     f"Soru: {query}\n\nKaynaklar:\n{context}\n\nCevap:"
                 )
                 resp = self._ollama.chat(
                     model=self.ollama_model,
                     messages=[{"role": "user", "content": prompt}],
-                    options={"temperature": 0.2, "num_predict": max_output_tokens, "num_ctx": 4096},
+                    options={"temperature": 0.0, "num_predict": max_output_tokens, "num_ctx": 4096},
+                    keep_alive="30m",
                 )
                 return resp["message"]["content"].strip()
             except Exception as e:
@@ -721,6 +788,15 @@ class CKBEngine:
 
         flat = self._flatten(raw, doc_source_paths)
 
+        # ANCHOR TERİM FİLTRESİ: sorgudaki özel isim (varsa) korpusta hangi
+        # belgede geçiyorsa o belgeleri öne al. Bu adım build_extractive_answer
+        # ve rewrite_text'ten ÖNCE, yani belgeler max_docs/max_nodes ile
+        # kesilmeden ÖNCE çalışır — "Gordion" belgesi TreeSearch'ün ham
+        # skoruna göre 4. sırada bile olsa, artık 1. sıraya taşınır ve
+        # kesilme (truncation) sırasında kaybolmaz.
+        anchor_terms = _extract_anchor_terms(query, flat)
+        flat, has_evidence = _rerank_by_anchor_terms(flat, anchor_terms)
+
         t0 = time.time()
         extractive = self.build_extractive_answer(query, flat)
         timings["extractive_answer_ms"] = round((time.time() - t0) * 1000, 1)
@@ -732,4 +808,6 @@ class CKBEngine:
             "original_query": query,
             "timings": timings,
             "resources": self.get_resource_usage(),
+            "anchor_terms": sorted(anchor_terms),
+            "has_sufficient_evidence": has_evidence,
         }

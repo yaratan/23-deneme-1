@@ -192,7 +192,10 @@ with ana_kolon:
                 removed_count = 0
                 if akici_tiklandi:
                     with st.spinner("Akıcı cevap üretiliyor (Ollama)..."):
-                        akici_metin = engine.rewrite_text(soru, sonuc["documents"])
+                        akici_metin = engine.rewrite_text(
+                            soru, sonuc["documents"],
+                            has_sufficient_evidence=sonuc.get("has_sufficient_evidence", True),
+                        )
                         if akici_metin:
                             grounding = engine.check_grounding(akici_metin, sonuc["documents"])
                             grounded_sentences = [g for g in grounding if g["grounded"]]
@@ -220,6 +223,15 @@ with ana_kolon:
 
                 if sonuc.get("used_query") and sonuc["used_query"] != soru:
                     st.caption(f"🔎 Genişletilmiş sorgu: `{sonuc['used_query']}`")
+
+                if sonuc.get("anchor_terms"):
+                    st.caption(f"🎯 Özel isim eşleşmesi: `{', '.join(sonuc['anchor_terms'])}`")
+                    if not sonuc.get("has_sufficient_evidence", True):
+                        st.warning(
+                            f"⚠️ Sorgudaki özel isim ({', '.join(sonuc['anchor_terms'])}) "
+                            "hiçbir kaynak belgede geçmiyor. Aşağıdaki sonuçlar alakalı "
+                            "olmayabilir, dikkatli değerlendirin."
+                        )
 
                 belgeler = sonuc.get("documents", [])
 
